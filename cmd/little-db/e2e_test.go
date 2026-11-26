@@ -232,6 +232,67 @@ func TestE2ETransportErrorOnBadAddr(t *testing.T) {
 	}
 }
 
+// TestE2EReadiness covers the CLI contract for the write-readiness probe:
+// ready -> exit 0, unreachable -> exit 1, bad usage -> exit 2. The two
+// refusal statuses (exits 6/7) are exercised over the wire in the server
+// package; classifyErr's mapping is pinned separately below.
+func TestE2EReadiness(t *testing.T) {
+	addr := startTestServer(t)
+
+	// Healthy instance: "ready" on stdout, exit 0.
+	out, errb, code := invoke([]string{"readiness", "--addr", addr}, "")
+	if code != exitOK {
+		t.Fatalf("readiness healthy: code=%d stderr=%q", code, errb)
+	}
+	if strings.TrimSpace(out) != "ready" {
+		t.Fatalf("readiness stdout = %q want %q", out, "ready")
+	}
+
+	// Positional args are a usage error.
+	_, _, code = invoke([]string{"readiness", "--addr", addr, "extra"}, "")
+	if code != exitUsage {
+		t.Fatalf("readiness with positional: code=%d want exitUsage=%d", code, exitUsage)
+	}
+}
+
+func TestE2EReadinessUnreachableIsExitTransport(t *testing.T) {
+	// Refused dial must be indistinguishable from any other transport
+	// failure at the exit-code level (1), and distinct from both refusal
+	// statuses (6/7).
+	_, errb, code := invoke([]string{
+		"readiness", "--addr", "127.0.0.1:1", "--dial-timeout", "500ms",
+	}, "")
+	if code == exitOK {
+		t.Skip("something is actually listening on 127.0.0.1:1; skipping")
+	}
+	if code != exitTransport {
+		t.Fatalf("code=%d want exitTransport=%d (stderr=%q)", code, exitTransport, errb)
+	}
+	if code == exitDraining || code == exitWriteDisabled {
+		t.Fatalf("unreachable must not map to a readiness refusal code")
+	}
+}
+
+// TestE2EReadinessExitCodesDistinct pins that the three non-ready
+// outcomes the traffic director switches on have separate exit codes.
+func TestE2EReadinessExitCodesDistinct(t *testing.T) {
+	codes := map[string]int{
+		"transport":      exitTransport,
+		"draining":       exitDraining,
+		"write-disabled": exitWriteDisabled,
+	}
+	seen := map[int]string{}
+	for name, c := range codes {
+		if prev, dup := seen[c]; dup {
+			t.Fatalf("exit code %d shared by %q and %q", c, prev, name)
+		}
+		seen[c] = name
+		if c == exitOK {
+			t.Fatalf("%s must not use the success exit code", name)
+		}
+	}
+}
+
 // TestE2EPrevalidationExitCodes pins the fix for the medium finding:
 // local request-shape errors (empty key, oversize key/value) must exit
 // with exitUsage (2), not exitTransport (1). The CLI must not dial.

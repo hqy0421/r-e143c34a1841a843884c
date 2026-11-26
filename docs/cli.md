@@ -27,6 +27,7 @@ day-2 operations (sizing, fsync, restart) see [ops.md](ops.md).
    - [`batch`](#batch)
    - [`stats`](#stats)
    - [`ping`](#ping)
+   - [`readiness`](#readiness)
 8. [Recipes](#recipes)
 
 ---
@@ -134,6 +135,8 @@ a connection.
 |  `3` | Server returned `BAD_REQUEST` or `INTERNAL`.                                                   |
 |  `4` | `NOT_FOUND` (only `get` returns this from a successful round trip).                            |
 |  `5` | Server returned `OVERLOAD` or `CLOSED` (back off and retry).                                   |
+|  `6` | `readiness` only: server is draining (graceful shutdown in progress).                          |
+|  `7` | `readiness` only: engine writes are disabled after an uncertain manifest publish.             |
 
 All non-zero exits write a human-readable diagnostic to **stderr**.
 
@@ -477,12 +480,58 @@ key_count=10000 bytes_on_disk=1142038
 
 ## `ping`
 
-Health-check the server. Writes `pong` to **stdout** on success.
+Liveness check. Writes `pong` to **stdout** on success.
 
 ### Synopsis
 
 ```
 little-db ping [global flags]
+```
+
+`ping` answers exactly one question: **is the process alive and serving
+the wire protocol?** It returns `0` even while the instance is draining
+or the engine has refused further writes — those conditions do not make
+the process dead. To decide whether an instance may receive write
+traffic, use [`readiness`](#readiness).
+
+---
+
+## `readiness`
+
+Write-readiness probe for traffic directors deciding whether to send
+writes to an instance. Takes no positional arguments.
+
+### Synopsis
+
+```
+little-db readiness [global flags]
+```
+
+### Outcomes
+
+The probe distinguishes three non-ready conditions so automation can
+react differently to each:
+
+| Outcome                                                  | Exit code | Meaning                                                                                                                                  |
+| -------------------------------------------------------- | --------: | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Ready                                                    |       `0` | Prints `ready` to stdout; the engine accepts writes and the server is not draining.                                                      |
+| Draining                                                 |       `6` | The server has begun graceful shutdown and will not accept new write traffic, though in-flight requests are allowed to finish.          |
+| Write disabled                                           |       `7` | The engine hit an uncertain manifest publish during segment rotation and entered its sticky write-refusing state; only a successful reopen (process restart) clears it. Reads still work. |
+| Unreachable / transport failure                         |       `1` | Dial, timeout, or framing failure — no status byte was received. Distinct from both refusal statuses, which require a live server.      |
+
+`ping` and `readiness` are deliberately separate: an instance can be
+alive (`ping` → `pong`) while not write-ready (`readiness` → `6` or
+`7`). The readiness verdict is a pure state query — it performs no
+probe write, so it cannot mutate the database or change the state it
+reports.
+
+### Example
+
+```bash
+# Only route writes back once readiness reports exit 0.
+if little-db readiness --addr 127.0.0.1:4242; then
+  enable_writer_in_load_balancer
+fi
 ```
 
 ---

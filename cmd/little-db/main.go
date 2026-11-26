@@ -11,6 +11,8 @@
 //	3  remote BAD_REQUEST or INTERNAL
 //	4  remote NOT_FOUND (Get / Delete returning a missing key)
 //	5  remote OVERLOAD or CLOSED
+//	6  remote DRAINING (readiness probe: server is shutting down)
+//	7  remote WRITE_DISABLED (readiness probe: engine refuses writes)
 //
 // The package keeps an internal `run(args, stdin, stdout, stderr) int`
 // entry point so end-to-end tests can drive the CLI in-process without
@@ -33,12 +35,14 @@ import (
 )
 
 const (
-	exitOK         = 0
-	exitTransport  = 1
-	exitUsage      = 2
-	exitRemoteBad  = 3
-	exitNotFound   = 4
-	exitOverloaded = 5
+	exitOK            = 0
+	exitTransport     = 1
+	exitUsage         = 2
+	exitRemoteBad     = 3
+	exitNotFound      = 4
+	exitOverloaded    = 5
+	exitDraining      = 6
+	exitWriteDisabled = 7
 
 	defaultAddr           = "127.0.0.1:4242"
 	defaultDialTimeout    = 5 * time.Second
@@ -75,6 +79,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runStats(rest, stdout, stderr)
 	case "ping":
 		return runPing(rest, stdout, stderr)
+	case "readiness":
+		return runReadiness(rest, stdout, stderr)
 	case "-h", "--help", "help":
 		printUsage(stdout)
 		return exitOK
@@ -96,7 +102,8 @@ Subcommands:
   range    Stream a key range
   batch    Submit a batch (NDJSON on stdin with "-")
   stats    Print server stats
-  ping     Health-check the server
+  ping     Liveness-check the server
+  readiness Check whether the instance may receive write traffic
 
 Run "little-db <subcommand> --help" for subcommand flags.`)
 }

@@ -228,8 +228,37 @@ func (c *Client) Batch(entries []wire.BatchEntry) error {
 }
 
 // Ping is a liveness check. Returns nil if the server replied OK.
+//
+// Ping answers only "is the process up and serving frames?" — it stays
+// OK while the server is draining and while the engine has disabled
+// writes. Use WriteReady before routing write traffic to an instance.
 func (c *Client) Ping() error {
 	status, body, err := c.roundTripUnary(&wire.PingRequest{})
+	if err != nil {
+		return err
+	}
+	return statusToErr(status, body)
+}
+
+// WriteReady probes whether the server may receive write traffic.
+//
+// The three possible outcomes are deliberately distinguishable:
+//
+//   - nil: the instance is write-ready (server not draining, engine
+//     accepting writes).
+//   - *wire.RemoteError with wire.StatusWriteDisabled: the engine
+//     entered its sticky write-disabled state after an uncertain
+//     manifest publish; it stays disabled until the process reopens
+//     the database.
+//   - *wire.RemoteError with wire.StatusDraining: the server is
+//     shutting down and only draining in-flight work.
+//
+// An unreachable instance never yields a RemoteError: a dial failure,
+// EOF, or deadline surfaces as the underlying transport error, which
+// callers distinguish with errors.As (net.OpError, io.EOF,
+// os.ErrDeadlineExceeded).
+func (c *Client) WriteReady() error {
+	status, body, err := c.roundTripUnary(&wire.WriteReadyRequest{})
 	if err != nil {
 		return err
 	}

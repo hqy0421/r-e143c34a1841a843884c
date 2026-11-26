@@ -185,6 +185,10 @@ func classifyErr(err error, stderr io.Writer) int {
 			return exitRemoteBad
 		case wire.StatusOverload, wire.StatusClosed:
 			return exitOverloaded
+		case wire.StatusDraining:
+			return exitDraining
+		case wire.StatusWriteDisabled:
+			return exitWriteDisabled
 		default:
 			return exitRemoteBad
 		}
@@ -217,6 +221,10 @@ func statusName(s wire.Status) string {
 		return "CLOSED"
 	case wire.StatusOverload:
 		return "OVERLOAD"
+	case wire.StatusWriteDisabled:
+		return "WRITE_DISABLED"
+	case wire.StatusDraining:
+		return "DRAINING"
 	default:
 		return fmt.Sprintf("status(0x%02x)", uint8(s))
 	}
@@ -448,6 +456,49 @@ func runPing(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, "pong")
 	return exitOK
+}
+
+// ---------------------------------------------------------------------
+// readiness
+// ---------------------------------------------------------------------
+
+// runReadiness drives the WRITEREADY probe. It is distinct from ping:
+// ping proves liveness and stays OK while the instance drains or refuses
+// writes; readiness reports whether write traffic may be routed here.
+//
+// Exit codes are the machine-readable contract for traffic directors:
+//
+//	0  write-ready (prints "ready")
+//	6  DRAINING — server is shutting down, drain only
+//	7  WRITE_DISABLED — engine in the fatal uncertain-manifest state
+//	1  unreachable / transport failure (dial refused, deadline, EOF)
+func runReadiness(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("readiness", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	co := registerConnFlags(fs)
+	if err := parseFlags(fs, args); err != nil {
+		return exitUsage
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "readiness: takes no positional args")
+		return exitUsage
+	}
+	c, code := dialClient(co, stderr)
+	if code != exitOK {
+		// dialClient already printed the transport diagnostic; the
+		// non-zero (exitTransport) return is how an unreachable
+		// instance is distinguished from both refusal statuses.
+		return code
+	}
+	defer c.Close()
+	err := c.WriteReady()
+	if err == nil {
+		fmt.Fprintln(stdout, "ready")
+		return exitOK
+	}
+	// classifyErr maps DRAINING -> exitDraining and WRITE_DISABLED ->
+	// exitWriteDisabled; transport failures map to exitTransport.
+	return classifyErr(err, stderr)
 }
 
 // ---------------------------------------------------------------------

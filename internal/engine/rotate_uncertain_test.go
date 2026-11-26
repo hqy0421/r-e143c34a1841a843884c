@@ -124,5 +124,33 @@ func TestRotateUncertainDisablesWrites(t *testing.T) {
 		}
 	}
 
+	// The readiness query must reflect the sticky state immediately,
+	// without any caller attempting a write first.
+	if !db.WritesDisabled() {
+		t.Fatal("WritesDisabled() = false after uncertain rotation; want true")
+	}
+
 	_ = fmt.Sprintf // keep fmt import even if future edits trim usage
+}
+
+// TestWritesDisabledFalseOnHealthyDB pins the ready side of the
+// readiness query: a normally opened engine reports false, and stays
+// false across successful writes. The flip-to-true path is covered by
+// TestRotateUncertainDisablesWrites above.
+func TestWritesDisabledFalseOnHealthyDB(t *testing.T) {
+	db, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if db.WritesDisabled() {
+		t.Fatal("fresh DB must not report writes disabled")
+	}
+	if err := db.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if db.WritesDisabled() {
+		t.Fatal("healthy DB flipped to writes disabled after a successful Put")
+	}
 }

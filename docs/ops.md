@@ -194,16 +194,43 @@ under a second on an NVMe SSD.
 
 ## 7. Observable state
 
-| Surface           | What it tells you                                             |
-| ----------------- | ------------------------------------------------------------- |
-| Boot log line     | Resolved config — sync mode, queue depth, segments, keys.     |
-| `little-db stats` | `KeyCount` (live keys) and `BytesOnDisk` (sum of live segs).  |
-| `little-db ping`  | TCP round-trip + server liveness.                             |
-| Process exit code | Non-zero means the engine couldn't open or shut down cleanly. |
+| Surface              | What it tells you                                             |
+| -------------------- | ------------------------------------------------------------- |
+| Boot log line        | Resolved config — sync mode, queue depth, segments, keys.     |
+| `little-db stats`    | `KeyCount` (live keys) and `BytesOnDisk` (sum of live segs).  |
+| `little-db ping`     | TCP round-trip + server liveness. Liveness only — stays green while draining or write-disabled. |
+| `little-db readiness` | Write-readiness verdict: exit `0` ready, `6` draining, `7` engine write-disabled, `1` unreachable. |
+| Process exit code    | Non-zero means the engine couldn't open or shut down cleanly. |
 
 `KeyCount` and `BytesOnDisk` are individually consistent but not
 mutually atomic — under load they're a snapshot, not a transaction.
 Good enough for capacity dashboards; not a billing source of truth.
+
+### Liveness vs. write-readiness
+
+`ping` and `readiness` answer different questions and should drive
+different automation:
+
+- **`ping`** is a liveness check. A process that is draining, or whose
+  engine has entered the write-refusing state, is still alive and keeps
+  answering `pong`. Use it for process supervision and restart policies.
+- **`readiness`** is the gate for write traffic. It inspects two server
+  states without attempting a write:
+  1. The drain flag set when graceful shutdown begins — exit `6`
+     (`DRAINING`). An accepted instance that is draining must not
+     receive new writes; in-flight requests are still allowed to finish.
+  2. The engine's sticky `writesDisabled` flag — exit `7`
+     (`WRITE_DISABLED`). This flips on immediately when a segment
+     rotation's manifest publish is uncertain (the directory fsync after
+     the rename did not confirm) and never reverts in-process: reads
+     continue, every write returns `ErrWritesDisabled`, and only a
+     successful reopen after process restart reports ready again.
+- A connection failure is a third, inherently distinct outcome — exit
+  `1` with no wire status at all — so a traffic director can tell
+  "instance refuses writes" apart from "instance did not answer".
+
+Draining takes precedence if both flags are set (the instance is
+leaving rotation anyway).
 
 ---
 
@@ -214,6 +241,9 @@ Good enough for capacity dashboards; not a billing source of truth.
 | `serve: open engine: ... directory is locked`             | Another `little-db` process holds the data-dir flock.                               | Find and stop the other process. Never delete the lockfile by hand.                                      |
 | Client gets `OVERLOAD` on `range`                         | Too many concurrent range streams **or** payload over `--max-range-response-bytes`. | Increase the cap if intentional; otherwise the client should narrow the range or back off.               |
 | Client gets `BAD_REQUEST` on `put`                        | Empty key, oversized batch, or malformed wire frame.                                | Fix the caller. Empty key is a hard sentinel (`engine.ErrEmptyKey`).                                     |
+| `readiness` exits `7` (`WRITE_DISABLED`)                 | A segment rotation's manifest publish was uncertain (directory fsync unconfirmed). The engine refuses all writes to avoid acknowledging data that could vanish on a host crash; reads still work. | Do not route writes back. Restart the process so the engine reopens and reconciles the on-disk state; investigate storage health first. The state is sticky until a successful reopen. |
+| `readiness` exits `6` (`DRAINING`)                       | Graceful shutdown has begun; the drain flag is set and new write traffic is refused while in-flight requests finish. | Remove the instance from write rotation (a load-balancer drain should already be underway); do not treat as a crash — `ping` still succeeds. |
+| `readiness` exits `1` while `ping` also fails            | Transport-level failure: the process did not answer (dial refused, timeout, reset).  | Treat as unreachable; fall back to process supervision. Distinct from exits `6`/`7`, which require a live server answering the probe. |
 | `BytesOnDisk` keeps growing, `KeyCount` flat              | Dead bytes accumulating — compaction is off or behind.                              | Set `--compaction-interval` (e.g. `1h`) and restart.                                                     |
 | Sync-put latency suddenly 10× worse                       | Disk degraded, or another tenant saturated the device.                              | Check `iostat` / cloud disk metrics; little-db is one `fsync` per write, no hidden amplification.        |
 | Process exits with non-zero on shutdown                   | `Close` failed to flush — usually a full disk.                                      | Inspect logs; the engine refuses to ack writes it couldn't flush, but a stuck `fsync` can wedge `Close`. |

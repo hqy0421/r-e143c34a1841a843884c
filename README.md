@@ -72,7 +72,8 @@ recipes — lives in [docs/cli.md](docs/cli.md).
 | `range`    | Stream `[--start, --end)` to stdout (`ndjson` or `raw`). |
 | `batch`    | Atomic multi-op from NDJSON (`--plain` or base64).       |
 | `stats`    | `key_count=… bytes_on_disk=…`.                           |
-| `ping`     | `pong` on success.                                       |
+| `ping`      | `pong` — liveness only.                                  |
+| `readiness` | Write-readiness verdict (`ready`; distinct refusal exits). |
 
 Every client subcommand accepts `--addr` (default `127.0.0.1:4242`,
 env `LITTLE_DB_ADDR`), `--dial-timeout`, and `--request-timeout`.
@@ -94,8 +95,8 @@ little-db batch --plain - < testdata/users.10k.ndjson
 ```
 
 Exit codes: `0` ok · `1` transport · `2` usage · `3` server bad/internal
-· `4` not found · `5` overload/closed. See
-[docs/cli.md](docs/cli.md#exit-codes) for the full table.
+· `4` not found · `5` overload/closed · `6` draining · `7` write
+disabled. See [docs/cli.md](docs/cli.md#exit-codes) for the full table.
 
 ### Loading a JSON file
 

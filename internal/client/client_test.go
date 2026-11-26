@@ -151,6 +151,80 @@ func TestClientPing(t *testing.T) {
 	}
 }
 
+func TestClientWriteReadyOK(t *testing.T) {
+	var gotReq wire.Op
+	conn, _ := newMockPair(t, func(req wire.Request) [][2]any {
+		gotReq = req.Op()
+		return [][2]any{okFrame(nil)}
+	})
+	c := newTestClient(t, conn)
+	if err := c.WriteReady(); err != nil {
+		t.Fatalf("WriteReady: %v", err)
+	}
+	if gotReq != wire.OpWriteReady {
+		t.Fatalf("server saw opcode %v, want WRITEREADY", gotReq)
+	}
+}
+
+func TestClientWriteReadyWriteDisabled(t *testing.T) {
+	conn, _ := newMockPair(t, func(req wire.Request) [][2]any {
+		_ = req.(*wire.WriteReadyRequest)
+		return [][2]any{errFrame(wire.StatusWriteDisabled, "manifest uncertain")}
+	})
+	c := newTestClient(t, conn)
+	err := c.WriteReady()
+	var re *wire.RemoteError
+	if !errors.As(err, &re) {
+		t.Fatalf("want *wire.RemoteError, got %T %v", err, err)
+	}
+	if re.Status != wire.StatusWriteDisabled {
+		t.Fatalf("status = %v want WRITE_DISABLED", re.Status)
+	}
+	if re.Msg != "manifest uncertain" {
+		t.Fatalf("msg = %q", re.Msg)
+	}
+}
+
+func TestClientWriteReadyDraining(t *testing.T) {
+	conn, _ := newMockPair(t, func(req wire.Request) [][2]any {
+		_ = req.(*wire.WriteReadyRequest)
+		return [][2]any{errFrame(wire.StatusDraining, "shutting down")}
+	})
+	c := newTestClient(t, conn)
+	err := c.WriteReady()
+	var re *wire.RemoteError
+	if !errors.As(err, &re) {
+		t.Fatalf("want *wire.RemoteError, got %T %v", err, err)
+	}
+	if re.Status != wire.StatusDraining {
+		t.Fatalf("status = %v want DRAINING", re.Status)
+	}
+}
+
+// TestClientWriteReadyRefusalStatusesAreDistinct pins the three-way
+// discrimination the traffic director relies on: the two refusal states
+// carry different statuses, and a transport failure is not a RemoteError.
+func TestClientWriteReadyRefusalStatusesAreDistinct(t *testing.T) {
+	dis, drain := wire.StatusWriteDisabled, wire.StatusDraining
+	if dis == drain {
+		t.Fatal("WRITE_DISABLED and DRAINING must be distinct statuses")
+	}
+
+	// Transport-level failure: server closes without a frame.
+	clientSide, serverSide := net.Pipe()
+	_ = serverSide.Close()
+	t.Cleanup(func() { _ = clientSide.Close() })
+	c := NewClient(clientSide, Options{RequestTimeout: 2 * time.Second})
+	err := c.WriteReady()
+	if err == nil {
+		t.Fatal("WriteReady to a closed pipe must error")
+	}
+	var re *wire.RemoteError
+	if errors.As(err, &re) {
+		t.Fatalf("unreachable must not be a RemoteError, got %v", re)
+	}
+}
+
 func TestClientStats(t *testing.T) {
 	conn, _ := newMockPair(t, func(req wire.Request) [][2]any {
 		_ = req.(*wire.StatsRequest)

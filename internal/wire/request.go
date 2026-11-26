@@ -67,6 +67,17 @@ type PingRequest struct{}
 
 func (*PingRequest) Op() Op { return OpPing }
 
+// WriteReadyRequest carries a WRITEREADY command. Body is empty.
+//
+// Unlike PING (a pure liveness probe), WRITEREADY asks whether the
+// instance may receive write traffic right now. The server answers OK
+// when it is not draining and the engine still accepts writes,
+// WRITE_DISABLED when the engine has entered its sticky write-disabled
+// state, or DRAINING when the server is shutting down.
+type WriteReadyRequest struct{}
+
+func (*WriteReadyRequest) Op() Op { return OpWriteReady }
+
 // StatsRequest carries a STATS command. Body is empty.
 type StatsRequest struct{}
 
@@ -105,6 +116,11 @@ func DecodeRequest(op Op, body []byte) (Request, error) {
 			return nil, asProtocolErr("PING: expected empty body, got %d bytes", len(body))
 		}
 		return &PingRequest{}, nil
+	case OpWriteReady:
+		if len(body) != 0 {
+			return nil, asProtocolErr("WRITEREADY: expected empty body, got %d bytes", len(body))
+		}
+		return &WriteReadyRequest{}, nil
 	case OpStats:
 		if len(body) != 0 {
 			return nil, asProtocolErr("STATS: expected empty body, got %d bytes", len(body))
@@ -327,6 +343,8 @@ func encodeRequestBody(req Request) ([]byte, error) {
 	case *ReadKeyRangeRequest:
 		return encodeReadKeyRange(r)
 	case *PingRequest:
+		return nil, nil
+	case *WriteReadyRequest:
 		return nil, nil
 	case *StatsRequest:
 		return nil, nil

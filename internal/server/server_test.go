@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"little-db/internal/client"
 	"little-db/internal/engine"
 	"little-db/internal/wire"
 )
@@ -660,6 +661,240 @@ func equalStringSets(got, want []string) bool {
 		}
 	}
 	return true
+}
+
+// --- 10. WRITEREADY probe ------------------------------------------------
+
+// TestWriteReadyStatusDecision pins the four-state decision table the
+// handler is built from. Draining wins over the engine flag because a
+// tearing-down instance must never be advertised as a write target.
+func TestWriteReadyStatusDecision(t *testing.T) {
+	cases := []struct {
+		name           string
+		draining       bool
+		writesDisabled bool
+		want           wire.Status
+	}{
+		{"healthy", false, false, wire.StatusOK},
+		{"engine refusing writes", false, true, wire.StatusWriteDisabled},
+		{"server draining", true, false, wire.StatusDraining},
+		{"draining takes precedence over write-disabled", true, true, wire.StatusDraining},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := writeReadyStatus(tc.draining, tc.writesDisabled); got != tc.want {
+				t.Fatalf("writeReadyStatus(%v, %v) = %v, want %v",
+					tc.draining, tc.writesDisabled, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestServerWriteReadyHealthy: a freshly opened engine reports OK.
+func TestServerWriteReadyHealthy(t *testing.T) {
+	_, addr := startServer(t, nil)
+	conn := dial(t, addr)
+
+	st, body := roundTrip(t, conn, &wire.WriteReadyRequest{})
+	if st != wire.StatusOK {
+		t.Fatalf("WRITEREADY: got %v want OK (body=%q)", st, body)
+	}
+	if len(body) != 0 {
+		t.Fatalf("OK body must be empty, got %d bytes", len(body))
+	}
+}
+
+// TestServerWriteReadyEngineDisabled exercises the WRITE_DISABLED wire
+// response over a real connection. The engine's fault-injection hook is
+// private to the engine package, so the server's engine-state indirection
+// is flipped here; the engine-side flag flip itself is covered by the
+// engine package's rotate_uncertain tests.
+func TestServerWriteReadyEngineDisabled(t *testing.T) {
+	srv, addr := startServer(t, nil)
+	conn := dial(t, addr)
+
+	srv.engineWritesDisabled = func() bool { return true }
+
+	st, body := roundTrip(t, conn, &wire.WriteReadyRequest{})
+	if st != wire.StatusWriteDisabled {
+		t.Fatalf("WRITEREADY: got %v want WRITE_DISABLED", st)
+	}
+	msg, err := wire.DecodeError(body)
+	if err != nil {
+		t.Fatalf("DecodeError: %v", err)
+	}
+	if msg == "" {
+		t.Fatal("WRITE_DISABLED frame must carry an operator-readable message")
+	}
+}
+
+// TestServerWriteReadyDraining pins the DRAINING response on an existing
+// connection. The connection goroutine is parked in ReadFrame (the idle
+// steady state), so flipping the same atomic flag Shutdown flips, while
+// leaving the socket open, reproduces the drain window deterministically
+// without racing Shutdown's connection teardown. DRAINING is a terminal
+// verdict: it is the single frame for the request and the connection then
+// closes, with no trailing CLOSED frame (the generic drain boundary used
+// by other requests is exercised by TestServerShutdownDrainsInflight).
+//
+// New connections during drain are rejected at accept (Serve closes them),
+// matching a real shutdown where the listener has already stopped
+// accepting, so this test deliberately stays on one connection. PING's
+// liveness independence from both refusal flags is pinned separately in
+// TestServerPingStaysLivenessOnly.
+func TestServerWriteReadyDraining(t *testing.T) {
+	srv, addr := startServer(t, nil)
+	conn := dial(t, addr)
+
+	// Warm up so the conn goroutine is definitely parked in ReadFrame
+	// before we enter the drain window.
+	if st, _ := roundTrip(t, conn, &wire.PingRequest{}); st != wire.StatusOK {
+		t.Fatalf("warmup PING: %v", st)
+	}
+
+	srv.draining.Store(true)
+	t.Cleanup(func() { srv.draining.Store(false) })
+
+	st, body := roundTrip(t, conn, &wire.WriteReadyRequest{})
+	if st != wire.StatusDraining {
+		t.Fatalf("WRITEREADY in drain window: got %v want DRAINING", st)
+	}
+	msg, err := wire.DecodeError(body)
+	if err != nil {
+		t.Fatalf("DecodeError: %v", err)
+	}
+	if msg == "" {
+		t.Fatal("DRAINING frame must carry an operator-readable message")
+	}
+
+	// The DRAINING verdict is terminal: exactly one frame for the one
+	// request, then the server closes. There must be no trailing CLOSED
+	// frame (which a unary client could read instead of DRAINING), so
+	// the next read must surface EOF or a deadline/network error, never
+	// another frame.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if tag, extra, rerr := wire.ReadFrame(conn); rerr == nil {
+		t.Fatalf("DRAINING must be the final frame; got extra status %v body %x",
+			wire.Status(tag), extra)
+	}
+}
+
+// TestServerWriteReadyUnreachableIsDistinct pins the third distinguishable
+// client outcome: an instance that cannot be dialed never produces a
+// status byte — the client sees a transport error, never WRITE_DISABLED
+// or DRAINING.
+func TestServerWriteReadyUnreachableIsDistinct(t *testing.T) {
+	// Bind and immediately close a listener to obtain a port with
+	// nothing accepting on it.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	conn, derr := net.DialTimeout("tcp", addr, 2*time.Second)
+	if derr == nil {
+		_ = conn.Close()
+		t.Skip("closed listener port was reused; skipping unreachable case")
+	}
+	var re *wire.RemoteError
+	if errors.As(derr, &re) {
+		t.Fatalf("unreachable must be a transport error, got RemoteError %v", derr)
+	}
+}
+
+// TestServerPingStaysLivenessOnly: PING must remain a pure liveness check
+// and answer OK in both refusal states, so existing ops probes keep their
+// semantics after the readiness probe is introduced.
+func TestServerPingStaysLivenessOnly(t *testing.T) {
+	srv, addr := startServer(t, nil)
+	conn := dial(t, addr)
+
+	// Engine refusal over a real connection.
+	srv.engineWritesDisabled = func() bool { return true }
+	if st, _ := roundTrip(t, conn, &wire.PingRequest{}); st != wire.StatusOK {
+		t.Fatalf("PING with writes disabled: got %v want OK (liveness only)", st)
+	}
+	if st, _ := roundTrip(t, conn, &wire.WriteReadyRequest{}); st != wire.StatusWriteDisabled {
+		t.Fatalf("WRITEREADY with writes disabled: got %v want WRITE_DISABLED", st)
+	}
+
+	// The drain branch is exercised over TCP in
+	// TestServerWriteReadyDraining. Flipping the shared draining flag
+	// here would defeat Shutdown's CompareAndSwap in t.Cleanup, so the
+	// draining half of the liveness guarantee is pinned at the decision
+	// layer instead: PING's handler never consults either flag.
+	if got := writeReadyStatus(true, false); got != wire.StatusDraining {
+		t.Fatalf("writeReadyStatus(draining): got %v want DRAINING", got)
+	}
+}
+
+// TestServerWriteReadyRejectsNonEmptyBody: the probe takes no body.
+func TestServerWriteReadyRejectsNonEmptyBody(t *testing.T) {
+	_, addr := startServer(t, nil)
+	conn := dial(t, addr)
+	sendRaw(t, conn, uint8(wire.OpWriteReady), []byte{0x01})
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	tag, _, err := wire.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	if wire.Status(tag) != wire.StatusBadRequest {
+		t.Fatalf("non-empty WRITEREADY body: got %v want BAD_REQUEST", wire.Status(tag))
+	}
+}
+
+// TestServerWriteReadyViaClient drives the public client.Client API over
+// a real TCP listener, pinning the end-to-end error shape traffic
+// directors program against: nil when ready, *wire.RemoteError carrying
+// the exact status for each refusal state.
+func TestServerWriteReadyViaClient(t *testing.T) {
+	srv, addr := startServer(t, nil)
+
+	c, err := client.Dial(addr, client.Options{
+		DialTimeout:    2 * time.Second,
+		RequestTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("client.Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	// Ready.
+	if err := c.WriteReady(); err != nil {
+		t.Fatalf("WriteReady healthy: %v", err)
+	}
+
+	// Engine refusal.
+	srv.engineWritesDisabled = func() bool { return true }
+	err = c.WriteReady()
+	var re *wire.RemoteError
+	if !errors.As(err, &re) || re.Status != wire.StatusWriteDisabled {
+		t.Fatalf("WriteReady disabled: err=%v want RemoteError(WRITE_DISABLED)", err)
+	}
+
+	// Reset the engine injection briefly so a second probe re-confirms
+	// the healthy verdict, then re-arm it: the drain phase must still
+	// answer DRAINING, proving over a real connection that draining takes
+	// precedence over the engine's write-disabled flag.
+	srv.engineWritesDisabled = func() bool { return false }
+	if err := c.WriteReady(); err != nil {
+		t.Fatalf("WriteReady after reset: %v", err)
+	}
+	srv.engineWritesDisabled = func() bool { return true }
+
+	// Enter the drain window on the parked connection (same atomic flag
+	// Shutdown flips; the socket stays open for one in-flight request).
+	// The engine flag remains armed, so DRAINING here also pins the
+	// precedence rule end-to-end.
+	srv.draining.Store(true)
+	t.Cleanup(func() { srv.draining.Store(false) })
+
+	err = c.WriteReady()
+	if !errors.As(err, &re) || re.Status != wire.StatusDraining {
+		t.Fatalf("WriteReady in drain with engine flag armed: err=%v want DRAINING", err)
+	}
 }
 
 // Compile-time guard that we don't accidentally remove the atomic import

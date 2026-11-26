@@ -27,8 +27,33 @@
 //	                       count*10 <= remaining pre-allocation check sound)
 //	0x05 READKEYRANGE    u32 slen | start | u32 elen | end
 //	                       slen=0 means "open start"; elen=0 means "open end"
-//	0x06 PING            (empty body)
+//	0x06 PING            (empty body) — liveness only, never reflects
+//	                       write readiness
 //	0x07 STATS           (empty body)
+//	0x08 WRITEREADY      (empty body) — write-readiness probe; see below
+//
+// PING vs WRITEREADY:
+//
+// PING answers "is the process up and able to answer frames?". It always
+// returns OK as long as the connection is being served, including while
+// the server is draining and while the engine has entered its fatal
+// write-disabled state. Traffic directors must not use PING to decide
+// where to send writes.
+//
+// WRITEREADY answers "may this instance receive write traffic right now?".
+// It returns OK only when the server is NOT draining AND the engine is
+// still accepting writes. Every non-OK answer is a distinct, client-
+// distinguishable status:
+//
+//	WRITE_DISABLED — the engine entered its sticky write-disabled state
+//	                 after an uncertain manifest publish; it stays until
+//	                 the process reopens the database successfully.
+//	DRAINING       — the server has begun graceful shutdown and is only
+//	                 draining in-flight work.
+//
+// An instance that cannot be reached produces a transport-level error
+// (dial failure, EOF, deadline), never a status byte, so "unreachable"
+// is distinguishable from both refusal states at the client API.
 //
 // Statuses (response tags):
 //
@@ -38,6 +63,8 @@
 //	0x03 INTERNAL
 //	0x04 CLOSED
 //	0x05 OVERLOAD
+//	0x06 WRITE_DISABLED
+//	0x07 DRAINING
 //
 // Non-OK responses carry an error envelope as their body:
 //
@@ -116,6 +143,7 @@ const (
 	OpReadKeyRange Op = 0x05
 	OpPing         Op = 0x06
 	OpStats        Op = 0x07
+	OpWriteReady   Op = 0x08
 )
 
 // String returns a stable name for the opcode, useful for log lines.
@@ -135,6 +163,8 @@ func (o Op) String() string {
 		return "PING"
 	case OpStats:
 		return "STATS"
+	case OpWriteReady:
+		return "WRITEREADY"
 	default:
 		return "UNKNOWN"
 	}
@@ -144,12 +174,14 @@ func (o Op) String() string {
 type Status uint8
 
 const (
-	StatusOK         Status = 0x00
-	StatusNotFound   Status = 0x01
-	StatusBadRequest Status = 0x02
-	StatusInternal   Status = 0x03
-	StatusClosed     Status = 0x04
-	StatusOverload   Status = 0x05
+	StatusOK            Status = 0x00
+	StatusNotFound      Status = 0x01
+	StatusBadRequest    Status = 0x02
+	StatusInternal      Status = 0x03
+	StatusClosed        Status = 0x04
+	StatusOverload      Status = 0x05
+	StatusWriteDisabled Status = 0x06
+	StatusDraining      Status = 0x07
 )
 
 // String returns a stable name for the status.
@@ -167,6 +199,10 @@ func (s Status) String() string {
 		return "CLOSED"
 	case StatusOverload:
 		return "OVERLOAD"
+	case StatusWriteDisabled:
+		return "WRITE_DISABLED"
+	case StatusDraining:
+		return "DRAINING"
 	default:
 		return "UNKNOWN"
 	}

@@ -163,7 +163,7 @@ rather than a key+value pair. See §7.1 for the exhaustive record table.
 | NF3 | Dataset > RAM         | Only the keydir is in RAM. Values live on disk. Keydir entry ≈ 32–48 bytes/key                       |
 | NF4 | Crash recovery        | Append-only log + CRC32C per record + recovery scan on `Open`                                        |
 | NF5 | Predictability        | Compaction runs in a background goroutine, never blocks writes                                       |
-| NF6 | Observability         | `/health` and `/stats` over the TCP protocol; structured boot-time log line of resolved config       |
+| NF6 | Observability         | Liveness (`PING`) and write-readiness (`WRITEREADY`) plus `/stats` over the TCP protocol; structured boot-time log line of resolved config. Readiness distinguishes draining, engine write-disabled, and unreachable so write traffic can be gated safely |
 | NF7 | Operability           | Single static binary, single data directory, env-var-driven config with Joi-style validation at boot |
 
 ## 6. Architecture overview

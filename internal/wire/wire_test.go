@@ -113,6 +113,7 @@ func TestRequestRoundTrip(t *testing.T) {
 		&ReadKeyRangeRequest{End: []byte("z")},                     // open start
 		&ReadKeyRangeRequest{Start: []byte("k"), End: []byte("k")}, // equal
 		&PingRequest{},
+		&WriteReadyRequest{},
 		&StatsRequest{},
 	}
 	for _, req := range cases {
@@ -168,6 +169,9 @@ func requestsEqual(a, b Request) bool {
 		return ok && bytes.Equal(ar.Start, br.Start) && bytes.Equal(ar.End, br.End)
 	case *PingRequest:
 		_, ok := b.(*PingRequest)
+		return ok
+	case *WriteReadyRequest:
+		_, ok := b.(*WriteReadyRequest)
 		return ok
 	case *StatsRequest:
 		_, ok := b.(*StatsRequest)
@@ -256,6 +260,7 @@ func TestDecodeRequestRejectsInvalid(t *testing.T) {
 			return b
 		}()},
 		{"PING with body", OpPing, []byte{0x01}},
+		{"WRITEREADY with body", OpWriteReady, []byte{0x01}},
 		{"STATS with body", OpStats, []byte{0x01}},
 	}
 	for _, tc := range cases {
@@ -529,6 +534,62 @@ func TestDecodeRangeFrameInvalid(t *testing.T) {
 				t.Fatalf("want *ProtocolError, got %T %v", err, err)
 			}
 		})
+	}
+}
+
+// --- readiness opcode / statuses ----------------------------------------
+
+// TestWriteReadyWireContract pins the wire-level distinctions the
+// readiness feature exists to provide: the opcode is its own value, the
+// two refusal statuses are distinct from each other and from every
+// pre-existing status, and their names are stable (operators grep logs
+// for them).
+func TestWriteReadyWireContract(t *testing.T) {
+	if OpWriteReady != 0x08 {
+		t.Fatalf("OpWriteReady = 0x%02x, want 0x08", uint8(OpWriteReady))
+	}
+	if OpWriteReady == OpPing {
+		t.Fatal("WRITEREADY must not share PING's opcode")
+	}
+	if got := OpWriteReady.String(); got != "WRITEREADY" {
+		t.Fatalf("opcode name = %q", got)
+	}
+
+	seen := map[Status]string{}
+	for _, s := range []Status{
+		StatusOK, StatusNotFound, StatusBadRequest, StatusInternal,
+		StatusClosed, StatusOverload, StatusWriteDisabled, StatusDraining,
+	} {
+		if name, dup := seen[s]; dup {
+			t.Fatalf("status value 0x%02x used by both %q and %q", uint8(s), name, s.String())
+		}
+		seen[s] = s.String()
+	}
+	if StatusWriteDisabled != 0x06 || StatusDraining != 0x07 {
+		t.Fatalf("status bytes shifted: WRITE_DISABLED=0x%02x DRAINING=0x%02x",
+			uint8(StatusWriteDisabled), uint8(StatusDraining))
+	}
+	if StatusWriteDisabled.String() != "WRITE_DISABLED" ||
+		StatusDraining.String() != "DRAINING" {
+		t.Fatalf("unexpected status names: %q %q",
+			StatusWriteDisabled.String(), StatusDraining.String())
+	}
+
+	// The empty-body request encodes to one tag byte inside the frame.
+	frame, err := EncodeRequest(&WriteReadyRequest{})
+	if err != nil {
+		t.Fatalf("EncodeRequest: %v", err)
+	}
+	// 4-byte length prefix + 1 payload byte (tag, no body).
+	if len(frame) != 5 {
+		t.Fatalf("encoded WRITEREADY frame = %d bytes, want 5", len(frame))
+	}
+	tag, body, err := ReadFrame(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	if Op(tag) != OpWriteReady || len(body) != 0 {
+		t.Fatalf("round trip: op=%v bodyLen=%d", Op(tag), len(body))
 	}
 }
 

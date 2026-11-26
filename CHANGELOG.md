@@ -6,6 +6,25 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Write-readiness probe (`WRITEREADY`, opcode `0x08`) distinct from the
+  liveness-only `PING`. The server reports `OK` when write-ready,
+  `DRAINING` (status `0x07`) while graceful shutdown is in progress, and
+  `WRITE_DISABLED` (status `0x06`) when the engine is in its sticky
+  write-refusing state after an uncertain manifest publish. Unreachable
+  remains a transport error with no status byte, keeping the three
+  non-ready outcomes distinguishable on the client.
+- `Engine.WritesDisabled()` accessor exposing the sticky
+  `writesDisabled` flag for readiness probing; a fresh `Open` always
+  reports `false`.
+- `little-db readiness` CLI subcommand: prints `ready` and exits `0`
+  when write-ready; new exit codes `6` (draining) and `7` (write
+  disabled); unreachable stays exit `1`. See `docs/cli.md`.
+
+### Changed
+- `PING` semantics documented as liveness-only: it continues to return
+  `pong` regardless of the drain or write-disabled flags.
+
 ## [0.1.0] - 2026-05-28
 
 Initial public release.

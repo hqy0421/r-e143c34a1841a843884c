@@ -69,3 +69,23 @@ func (db *DB) statsLocked() Stats {
 		BytesOnDisk: bytes,
 	}
 }
+
+// WritesDisabled reports whether the engine has entered its fatal
+// write-disabled state.
+//
+// The flag is set when a segment rotation hits
+// ErrManifestPublishedButUncertain (the manifest rename is visible but
+// the directory fsync did not confirm): from that moment on Put, Delete,
+// and BatchPut fail with ErrWritesDisabled, reads keep serving from the
+// prior sealed segments, and the flag never reverts within the lifetime
+// of this process. The operator must restart so Open can reconcile the
+// manifest; a freshly opened DB reports false again.
+//
+// It is the engine-side half of the write-readiness probe: callers
+// deciding where to route write traffic (the TCP server's WRITEREADY
+// handler, health scrapers) read this without attempting a write, so
+// readiness reflects the state immediately and does not depend on a
+// probe write landing first. Safe for concurrent use.
+func (db *DB) WritesDisabled() bool {
+	return db.writesDisabled.Load()
+}

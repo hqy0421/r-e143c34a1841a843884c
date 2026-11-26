@@ -120,6 +120,48 @@ type Server struct {
 
 	connsMu sync.Mutex
 	conns   map[net.Conn]struct{}
+
+	// engineWritesDisabled reports the engine's sticky write-disabled
+	// state. It defaults to db.WritesDisabled and is an indirection only
+	// so server-package tests (which cannot reach the engine package's
+	// private fault-injection hooks) can exercise the WRITE_DISABLED
+	// response over a real TCP connection.
+	engineWritesDisabled func() bool
+}
+
+// writeReadyStatus maps the server lifecycle flag and the engine's
+// write-disabled flag onto the wire status a WRITEREADY probe returns.
+//
+// Draining takes precedence: an instance that is already tearing down
+// must not be advertised as write-ready even if the engine itself would
+// still accept a write. The two failure modes stay distinct statuses so
+// traffic directors can tell "process unhealthy, restart required"
+// (WRITE_DISABLED) apart from "process deliberately draining"
+// (DRAINING). A total inability to connect is not represented here —
+// it surfaces to the client as a transport-level error.
+func writeReadyStatus(draining, writesDisabled bool) wire.Status {
+	switch {
+	case draining:
+		return wire.StatusDraining
+	case writesDisabled:
+		return wire.StatusWriteDisabled
+	default:
+		return wire.StatusOK
+	}
+}
+
+// writeReadyMessage is the human-readable envelope message carried
+// alongside a non-OK WRITEREADY status. The status byte is the
+// machine-readable contract; the message is for operator logs.
+func writeReadyMessage(status wire.Status) string {
+	switch status {
+	case wire.StatusDraining:
+		return "server is draining and will not accept new write traffic"
+	case wire.StatusWriteDisabled:
+		return "engine writes disabled after uncertain manifest publish; restart required"
+	default:
+		return "not write-ready"
+	}
 }
 
 // New constructs a Server bound to db. Options defaults are applied.
@@ -140,13 +182,14 @@ func New(db *engine.DB, opts Options) *Server {
 		opts.Logger = logging.Nop()
 	}
 	return &Server{
-		opts:       opts,
-		db:         db,
-		log:        opts.Logger,
-		debugReq:   opts.Logger.Enabled(context.Background(), slog.LevelDebug),
-		rangeSem:   make(chan struct{}, opts.MaxConcurrentRangeStreams),
-		shutdownCh: make(chan struct{}),
-		conns:      make(map[net.Conn]struct{}),
+		opts:                 opts,
+		db:                   db,
+		log:                  opts.Logger,
+		debugReq:             opts.Logger.Enabled(context.Background(), slog.LevelDebug),
+		rangeSem:             make(chan struct{}, opts.MaxConcurrentRangeStreams),
+		shutdownCh:           make(chan struct{}),
+		conns:                make(map[net.Conn]struct{}),
+		engineWritesDisabled: db.WritesDisabled,
 	}
 }
 
@@ -267,12 +310,6 @@ func (s *Server) untrackConn(c net.Conn) {
 // handleConn is the per-connection loop.
 func (s *Server) handleConn(conn net.Conn) {
 	for {
-		if s.draining.Load() {
-			// Best-effort polite close. Errors here are uninteresting;
-			// the deferred conn.Close() in Serve will run regardless.
-			_ = s.writeError(conn, wire.StatusClosed, "server shutting down")
-			return
-		}
 		if err := conn.SetReadDeadline(time.Now().Add(s.opts.ReadDeadline)); err != nil {
 			return
 		}
@@ -293,13 +330,43 @@ func (s *Server) handleConn(conn net.Conn) {
 				}
 				continue
 			}
-			// FrameError, network error, deadline, or other read error.
-			// Stream is desynchronized; close.
+			// FrameError, network error, or a read error while serving.
+			// This includes the past-deadline poke Shutdown uses to wake
+			// idle connections so they unwind and wg.Wait can complete.
+			// The framing is unusable (or we were explicitly woken to
+			// exit), so the connection closes. A request that was fully
+			// read before the error was already dispatched above, and the
+			// WRITEREADY handler reports DRAINING by inspecting the drain
+			// flag, so a probe in flight when shutdown began still got an
+			// explicit verdict on its response.
 			return
 		}
-		if err := s.dispatch(conn, req); err != nil {
+		terminal, err := s.dispatch(conn, req)
+		if err != nil {
 			// Any error from dispatch means we failed to write a
-			// response (transport-level) — close the connection.
+			// response (transport-level) - close the connection.
+			return
+		}
+		// A terminal response already told the client the connection's
+		// fate in request-specific terms (e.g. WRITEREADY's DRAINING).
+		// Sending the generic CLOSED frame too would put two frames on
+		// the wire for one request, which unary clients reading exactly
+		// one response frame would observe nondeterministically. Close
+		// directly instead.
+		if terminal {
+			return
+		}
+		// Graceful shutdown boundary. The request that was in flight has
+		// its full response on the wire, so we may now close politely
+		// instead of looping back to block on ReadFrame. The CLOSED frame
+		// is best-effort and informational: a client that already parsed
+		// its response treats the subsequent EOF as a clean idle
+		// disconnect. WRITEREADY's DRAINING verdict is terminal and exits
+		// above, so it never reaches this generic boundary.
+		// Idle connections never reach here: Shutdown's deadline poke
+		// unblocks their ReadFrame into the read-error branch above.
+		if s.draining.Load() {
+			_ = s.writeError(conn, wire.StatusClosed, "server shutting down")
 			return
 		}
 	}
@@ -319,6 +386,8 @@ func reqMeta(req wire.Request) (op string, keyLen, valLen, entries int) {
 		return "batch", 0, 0, len(r.Entries)
 	case *wire.PingRequest:
 		return "ping", 0, 0, 0
+	case *wire.WriteReadyRequest:
+		return "writeready", 0, 0, 0
 	case *wire.StatsRequest:
 		return "stats", 0, 0, 0
 	case *wire.ReadKeyRangeRequest:
@@ -353,10 +422,15 @@ func (s *Server) writeError(conn net.Conn, status wire.Status, msg string) error
 // enabled it emits one line per request with op, sizes, status, and
 // duration; the check is a single bool when DEBUG is off.
 //
+// The terminal bool is true when the response fully settles the
+// connection's fate in request-specific terms, so handleConn must close
+// without appending the generic drain CLOSED frame (which would make a
+// second frame for one request).
+//
 // WriteDeadline is set immediately before each write (after engine work
 // completes), so a slow Put/Get/BatchPut can't eat the whole deadline
 // budget before the response is even attempted.
-func (s *Server) dispatch(conn net.Conn, req wire.Request) error {
+func (s *Server) dispatch(conn net.Conn, req wire.Request) (terminal bool, err error) {
 	var start time.Time
 	if s.debugReq {
 		start = time.Now()
@@ -380,7 +454,11 @@ func (s *Server) dispatch(conn net.Conn, req wire.Request) error {
 		}
 		s.log.LogAttrs(context.Background(), slog.LevelDebug, "request", attrs...)
 	}
-	return err
+	// WRITEREADY answered with DRAINING is itself the polite shutdown
+	// notice for this probe: the client gets exactly one frame and the
+	// connection then closes, with no additional CLOSED frame.
+	terminal = status == wire.StatusDraining
+	return terminal, err
 }
 
 // dispatchOnce processes a single request and returns the wire status
@@ -427,7 +505,24 @@ func (s *Server) dispatchOnce(conn net.Conn, req wire.Request) (wire.Status, err
 		return wire.StatusOK, s.writeFrame(conn, uint8(wire.StatusOK), nil)
 
 	case *wire.PingRequest:
+		// Liveness only. PING stays OK regardless of the drain flag or
+		// the engine's write-disabled state: a process that can answer
+		// this frame is alive even when it must not receive writes.
 		return wire.StatusOK, s.writeFrame(conn, uint8(wire.StatusOK), nil)
+
+	case *wire.WriteReadyRequest:
+		// Readiness for write traffic. Unlike PING this combines the
+		// server lifecycle flag with the engine's real write state, so
+		// a traffic director can decide whether to route writes here.
+		// Both refusal states are sticky and observable immediately:
+		// writesDisabled flips the moment an uncertain manifest publish
+		// disables the writer, and draining is set before any in-flight
+		// request is allowed to finish.
+		status := writeReadyStatus(s.draining.Load(), s.engineWritesDisabled())
+		if status == wire.StatusOK {
+			return wire.StatusOK, s.writeFrame(conn, uint8(wire.StatusOK), nil)
+		}
+		return status, s.writeError(conn, status, writeReadyMessage(status))
 
 	case *wire.StatsRequest:
 		st := s.db.Stats()
